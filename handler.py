@@ -1,100 +1,137 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import asyncio
-from wan.text2video import Text2Video
-from wan.image2video import Image2Video
+from wan.text2video import WanT2V
 import torch
 import os
-from typing import Optional
-from celery import Celery
+from typing import Optional, Dict
 import uuid
+from wan.configs import WAN_CONFIGS, SIZE_CONFIGS
+import logging
+import time
+from torchvision.utils import save_image
+from wan.utils.utils import cache_video
+
+# Настройка логирования в начале файла
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Определяем константы
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 app = FastAPI()
 
-# Настройка Celery
-celery_app = Celery('tasks', broker='redis://localhost:6379/0', backend='redis://localhost:6379/0')
+# Хранилище задач
+tasks_store: Dict = {}
 
-# Инициализация моделей
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-text2video_model = Text2Video(device=device)
-image2video_model = Image2Video(device=device)
+# Инициализация модели
+device_id = 0 if torch.cuda.is_available() else "cpu"
+# Используем предопределенный конфиг для t2v-14B
+config = WAN_CONFIGS["t2v-14B"]
+text2video_model = WanT2V(
+    config=config,
+    checkpoint_dir="./Wan2.1-T2V-14B",
+    device_id=device_id,
+    rank=0
+)
 
-# Модели данных
+# Модель данных с размером 480p по умолчанию
 class Text2VideoRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = ""
     num_inference_steps: Optional[int] = 50
     guidance_scale: Optional[float] = 7.5
-    width: Optional[int] = 576
-    height: Optional[int] = 576
+    width: Optional[int] = 832  # Размер для 480p
+    height: Optional[int] = 480  # Размер для 480p
     num_frames: Optional[int] = 16
     fps: Optional[int] = 8
 
-class Image2VideoRequest(BaseModel):
-    image: str  # base64 encoded image
-    prompt: str
-    negative_prompt: Optional[str] = ""
-    num_inference_steps: Optional[int] = 40
-    guidance_scale: Optional[float] = 7.5
-    num_frames: Optional[int] = 16
-    fps: Optional[int] = 8
-
-# Celery tasks
-@celery_app.task
-def generate_text2video(task_id: str, params: dict):
+async def generate_video(task_id: str, params: dict):
+    start_time = time.time()
     try:
-        video = text2video_model.generate(**params)
-        output_path = f"/tmp/output_{task_id}.mp4"
-        video.save(output_path)
-        return {
+        logger.info(f"Начало генерации видео для task_id: {task_id}")
+        logger.debug(f"Параметры запроса: {params}")
+
+        size = SIZE_CONFIGS["832*480"]
+        logger.info(f"Установлен размер видео: {size}")
+
+        generation_start = time.time()
+        logger.info("Запуск генерации видео...")
+        video = text2video_model.generate(
+            input_prompt=params["prompt"],
+            size=size,
+            sampling_steps=params["num_inference_steps"],
+            guide_scale=params["guidance_scale"],
+            n_prompt=params["negative_prompt"],
+            frame_num=params["num_frames"]
+        )
+        generation_time = time.time() - generation_start
+        logger.info(f"Генерация видео завершена за {generation_time:.2f} секунд")
+
+        save_start = time.time()
+        output_path = os.path.join(RESULTS_DIR, f"output_{task_id}.mp4")
+        logger.info(f"Сохранение видео в {output_path}")
+
+        # Используем правильную функцию для сохранения видео
+        cache_video(
+            tensor=video[None],  # Добавляем размерность батча
+            save_file=output_path,
+            fps=params["fps"],
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1)
+        )
+
+        save_time = time.time() - save_start
+        logger.info(f"Видео успешно сохранено за {save_time:.2f} секунд")
+
+        total_time = time.time() - start_time
+        tasks_store[task_id] = {
             "status": "success",
             "output": {
                 "video_path": output_path,
                 "task_type": "text2video",
-                "prompt": params["prompt"]
+                "prompt": params["prompt"],
+                "generation_time": generation_time,
+                "save_time": save_time,
+                "total_time": total_time
             }
         }
+        logger.info(f"Задача {task_id} успешно завершена. Общее время выполнения: {total_time:.2f} секунд")
     except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-@celery_app.task
-def generate_image2video(task_id: str, params: dict):
-    try:
-        video = image2video_model.generate(**params)
-        output_path = f"/tmp/output_{task_id}.mp4"
-        video.save(output_path)
-        return {
-            "status": "success",
-            "output": {
-                "video_path": output_path,
-                "task_type": "image2video",
-                "prompt": params["prompt"]
-            }
+        total_time = time.time() - start_time
+        error_msg = f"Ошибка при генерации видео после {total_time:.2f} секунд работы: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        tasks_store[task_id] = {
+            "status": "error",
+            "error": str(e),
+            "execution_time": total_time
         }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
 
-# FastAPI endpoints
 @app.post("/text2video/create")
-async def create_text2video_task(request: Text2VideoRequest):
+async def create_text2video_task(request: Text2VideoRequest, background_tasks: BackgroundTasks):
+    logger.info("Получен новый запрос на создание видео")
+    logger.debug(f"Параметры запроса: {request.dict()}")
+
     task_id = str(uuid.uuid4())
+    logger.info(f"Создан task_id: {task_id}")
+
     params = request.dict()
+    tasks_store[task_id] = {"status": "processing"}
+    logger.info(f"Задача {task_id} добавлена в хранилище со статусом 'processing'")
 
-    # Запуск задачи асинхронно
-    task = generate_text2video.delay(task_id, params)
-
-    return {
-        "task_id": task_id,
-        "status": "processing"
-    }
-
-@app.post("/image2video/create")
-async def create_image2video_task(request: Image2VideoRequest):
-    task_id = str(uuid.uuid4())
-    params = request.dict()
-
-    # Запуск задачи асинхронно
-    task = generate_image2video.delay(task_id, params)
+    try:
+        logger.info("Добавление задачи в background_tasks")
+        background_tasks.add_task(generate_video, task_id, params)
+        logger.info("Задача успешно добавлена в background_tasks")
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении задачи в background_tasks: {str(e)}", exc_info=True)
+        tasks_store[task_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "task_id": task_id,
@@ -103,18 +140,22 @@ async def create_image2video_task(request: Image2VideoRequest):
 
 @app.get("/task/{task_id}")
 async def get_task_status(task_id: str):
-    # Проверяем статус задачи
-    task = celery_app.AsyncResult(task_id)
+    logger.info(f"Запрос статуса для task_id: {task_id}")
 
-    if task.ready():
-        result = task.get()
-        return result
-    else:
-        return {
-            "task_id": task_id,
-            "status": "processing"
-        }
+    if task_id not in tasks_store:
+        logger.warning(f"Задача {task_id} не найдена")
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    logger.info(f"Возвращаем статус для task_id {task_id}: {tasks_store[task_id]}")
+    return tasks_store[task_id]
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info("Запуск FastAPI сервера...")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="debug",
+        access_log=True
+    )
