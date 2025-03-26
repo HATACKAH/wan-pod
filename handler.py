@@ -11,46 +11,48 @@ import logging
 import time
 from torchvision.utils import save_image
 from wan.utils.utils import cache_video
+from concurrent.futures import ThreadPoolExecutor, Future
+from model_singleton import ModelSingleton
+from fastapi.middleware.cors import CORSMiddleware
 
-# Настройка логирования в начале файла
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Определяем константы
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 app = FastAPI()
 
-# Хранилище задач
-tasks_store: Dict = {}
-
-# Инициализация модели
-device_id = 0 if torch.cuda.is_available() else "cpu"
-# Используем предопределенный конфиг для t2v-14B
-config = WAN_CONFIGS["t2v-14B"]
-text2video_model = WanT2V(
-    config=config,
-    checkpoint_dir="./Wan2.1-T2V-14B",
-    device_id=device_id,
-    rank=0
+# Добавляем CORS middleware сразу после создания приложения
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Разрешаем запросы с любых источников
+    allow_credentials=True,
+    allow_methods=["*"],  # Разрешаем все HTTP методы
+    allow_headers=["*"],  # Разрешаем все заголовки
 )
 
-# Модель данных с размером 480p по умолчанию
+tasks_store: Dict[str, dict] = {}
+futures_store: Dict[str, Future] = {}
+
+text2video_model = ModelSingleton.get_model()
+
 class Text2VideoRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = ""
     num_inference_steps: Optional[int] = 50
     guidance_scale: Optional[float] = 7.5
-    width: Optional[int] = 832  # Размер для 480p
-    height: Optional[int] = 480  # Размер для 480p
+    width: Optional[int] = 832
+    height: Optional[int] = 480
     num_frames: Optional[int] = 16
     fps: Optional[int] = 8
 
-async def generate_video(task_id: str, params: dict):
+video_generator = ThreadPoolExecutor(max_workers=1)
+
+def generate_video(task_id: str, params: dict):
     start_time = time.time()
     try:
         logger.info(f"Начало генерации видео для task_id: {task_id}")
@@ -76,9 +78,8 @@ async def generate_video(task_id: str, params: dict):
         output_path = os.path.join(RESULTS_DIR, f"output_{task_id}.mp4")
         logger.info(f"Сохранение видео в {output_path}")
 
-        # Используем правильную функцию для сохранения видео
         cache_video(
-            tensor=video[None],  # Добавляем размерность батча
+            tensor=video[None],
             save_file=output_path,
             fps=params["fps"],
             nrow=1,
@@ -113,30 +114,24 @@ async def generate_video(task_id: str, params: dict):
         }
 
 @app.post("/text2video/create")
-async def create_text2video_task(request: Text2VideoRequest, background_tasks: BackgroundTasks):
+async def create_text2video_task(request: Text2VideoRequest):
+    from fastapi.responses import JSONResponse
+
     logger.info("Получен новый запрос на создание видео")
-    logger.debug(f"Параметры запроса: {request.dict()}")
-
     task_id = str(uuid.uuid4())
-    logger.info(f"Создан task_id: {task_id}")
+    params = request.model_dump()
 
-    params = request.dict()
     tasks_store[task_id] = {"status": "processing"}
-    logger.info(f"Задача {task_id} добавлена в хранилище со статусом 'processing'")
 
-    try:
-        logger.info("Добавление задачи в background_tasks")
-        background_tasks.add_task(generate_video, task_id, params)
-        logger.info("Задача успешно добавлена в background_tasks")
-    except Exception as e:
-        logger.error(f"Ошибка при добавлении задачи в background_tasks: {str(e)}", exc_info=True)
-        tasks_store[task_id] = {"status": "error", "error": str(e)}
-        raise HTTPException(status_code=500, detail=str(e))
+    future = video_generator.submit(generate_video, task_id, params)
+    futures_store[task_id] = future
 
-    return {
-        "task_id": task_id,
-        "status": "processing"
-    }
+    return JSONResponse(
+        content={
+            "task_id": task_id,
+            "status": "processing"
+        }
+    )
 
 @app.get("/task/{task_id}")
 async def get_task_status(task_id: str):
@@ -146,8 +141,33 @@ async def get_task_status(task_id: str):
         logger.warning(f"Задача {task_id} не найдена")
         raise HTTPException(status_code=404, detail="Task not found")
 
-    logger.info(f"Возвращаем статус для task_id {task_id}: {tasks_store[task_id]}")
-    return tasks_store[task_id]
+    # Добавляем информацию о статусе потока
+    response = tasks_store[task_id].copy()
+    if task_id in futures_store:
+        future = futures_store[task_id]
+        response["thread_status"] = {
+            "running": future.running(),
+            "done": future.done(),
+            "cancelled": future.cancelled()
+        }
+
+    logger.info(f"Возвращаем статус для task_id {task_id}: {response}")
+    return response
+
+@app.get("/tasks")
+async def get_all_tasks():
+    active_tasks = {}
+    for task_id in tasks_store:
+        task_info = tasks_store[task_id].copy()
+        if task_id in futures_store:
+            future = futures_store[task_id]
+            task_info["thread_status"] = {
+                "running": future.running(),
+                "done": future.done(),
+                "cancelled": future.cancelled()
+            }
+        active_tasks[task_id] = task_info
+    return active_tasks
 
 if __name__ == "__main__":
     import uvicorn
